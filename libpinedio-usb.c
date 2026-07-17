@@ -329,11 +329,16 @@ int32_t pinedio_set_option(struct pinedio_inst *inst, enum pinedio_option option
 }
 
 int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t mode) {
+  /* Same shadow state as pinedio_digital_write(), same lock. The transfer below
+   * is disabled, so the direction only reaches the chip on the next
+   * digital_write() -- but the bitmask must still not be torn. */
+  pinedio_mutex_lock(&inst->usb_access_mutex);
     if (mode == 1) { // output
     pinedio_d_mode |= (1 << pin);
   } else {
     pinedio_d_mode &= ~(1 << pin);
   }
+  pinedio_mutex_unlock(&inst->usb_access_mutex);
   uint8_t buf[] = {
           CH341_CMD_UIO_STREAM,
           CH341_CMD_UIO_STM_DIR | pinedio_d_mode, // enable output on d0-d5
@@ -348,6 +353,15 @@ int32_t pinedio_set_pin_mode(struct pinedio_inst *inst, uint32_t pin, uint32_t m
 }
 
 int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool active) {
+  /* Hold usb_access_mutex across the read-modify-write, the snapshot of the
+   * shadow state into buf, and the transfer itself, so concurrent GPIO writes
+   * cannot lose each other's bit or apply their packets out of order. The poll
+   * thread runs the interrupt callback with the mutex released, and consumers
+   * drive GPIO from that callback while the main thread does too, so this is
+   * reachable. usb_transfer() is told not to take the lock again: it is a plain
+   * mutex, not a recursive one. */
+  pinedio_mutex_lock(&inst->usb_access_mutex);
+
   if (active) {
     pinedio_d_state |= (1 << pin);
   } else {
@@ -360,7 +374,8 @@ int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool acti
           CH341_CMD_UIO_STM_END
   };
 
-  int32_t ret = usb_transfer(inst, __func__, sizeof(buf), 0, buf, NULL, true);
+  int32_t ret = usb_transfer(inst, __func__, sizeof(buf), 0, buf, NULL, false);
+  pinedio_mutex_unlock(&inst->usb_access_mutex);
   if (ret < 0) {
     printf("Failed to set CS pin.\n");
   }
@@ -526,14 +541,18 @@ static void* pinedio_pin_poll_thread(void* arg) {
     pinedio_mutex_lock(&inst->usb_access_mutex);
     for (uint8_t int_pin = 0; int_pin < PINEDIO_INT_PIN_MAX; int_pin++) {
       struct pinedio_inst_int* inst_int = &inst->interrupts[int_pin];
-      if (inst_int->callback == NULL) continue;
+      /* Copy the callback while holding the lock. Reading inst_int->callback
+       * again after the unlock below would race with pinedio_deattach_interrupt()
+       * setting it to NULL, and we would jump to NULL. */
+      void (*callback)(void) = inst_int->callback;
+      if (callback == NULL) continue;
       uint8_t state = (input & ( 1 << int_pin)) != 0;
       if (inst_int->previous_state != 255 && inst_int->previous_state != state) {
         enum pinedio_int_mode mode =
                 inst_int->previous_state == false && state == true ? PINEDIO_INT_MODE_RISING : PINEDIO_INT_MODE_FALLING;
         if (inst_int->mode & mode) {
           pinedio_mutex_unlock(&inst->usb_access_mutex);
-          inst_int->callback();
+          callback();
           pinedio_mutex_lock(&inst->usb_access_mutex);
         }
       }
@@ -552,21 +571,29 @@ pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin
   int32_t res = 0;
   // TODO: Add check if int_pin is correct
   pinedio_mutex_lock(&inst->usb_access_mutex);
-  if (inst->interrupts[int_pin].callback != NULL) {
-    inst->int_running_cnt--;
-  }
+  bool was_attached = inst->interrupts[int_pin].callback != NULL;
   inst->interrupts[int_pin].previous_state = 255;
   inst->interrupts[int_pin].mode = int_mode;
   inst->interrupts[int_pin].callback = callback;
-  if (inst->int_running_cnt == 0) {
-    inst->pin_poll_thread_exit = false;
-    res = pthread_create(&inst->pin_poll_thread, NULL, pinedio_pin_poll_thread, inst);
-    if (res != 0) {
-      fprintf(stderr, "Failed to create thread, res: %d\n", res);
-      goto unlock;
+
+  /* Only a new attachment touches the refcount. Re-arming a pin that is already
+   * attached must not drop the count to 0, because that made the check below
+   * spawn a second poll thread beside the running one: both then polled the same
+   * device and the first handle was overwritten and leaked. Consumers do re-arm
+   * without detaching first (meshtastic's RadioLib does), so this was reached in
+   * practice, not just in theory. */
+  if (!was_attached) {
+    if (inst->int_running_cnt == 0) {
+      inst->pin_poll_thread_exit = false;
+      res = pthread_create(&inst->pin_poll_thread, NULL, pinedio_pin_poll_thread, inst);
+      if (res != 0) {
+        fprintf(stderr, "Failed to create thread, res: %d\n", res);
+        inst->interrupts[int_pin].callback = NULL;
+        goto unlock;
+      }
     }
+    inst->int_running_cnt++;
   }
-inst->int_running_cnt++;
 
 unlock:
   pinedio_mutex_unlock(&inst->usb_access_mutex);
@@ -585,9 +612,14 @@ int32_t pinedio_deattach_interrupt(struct pinedio_inst *inst, enum pinedio_int_p
   inst->int_running_cnt--;
   if (inst->int_running_cnt == 0) {
     inst->pin_poll_thread_exit = true;
+    /* Copy the handle before releasing the lock: a concurrent attach would
+     * overwrite inst->pin_poll_thread with a newly created thread, and we would
+     * join that one instead. Joining under the lock is not an option, since the
+     * poll thread takes the same mutex. */
+    pthread_t thread_to_join = inst->pin_poll_thread;
     pinedio_mutex_unlock(&inst->usb_access_mutex);
-    if (inst->pin_poll_thread != pthread_self())
-      pthread_join(inst->pin_poll_thread, NULL);
+    if (!pthread_equal(thread_to_join, pthread_self()))
+      pthread_join(thread_to_join, NULL);
     return 0;
   }
 unlock:
@@ -599,8 +631,10 @@ void pinedio_deinit(struct pinedio_inst *inst) {
   pinedio_mutex_lock(&inst->usb_access_mutex);
   if (inst->int_running_cnt != 0) {
     inst->pin_poll_thread_exit = true;
+    pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
     pinedio_mutex_unlock(&inst->usb_access_mutex);
-    pthread_join(inst->pin_poll_thread, NULL);
+    if (!pthread_equal(thread_to_join, pthread_self()))
+      pthread_join(thread_to_join, NULL);
   } else {
     pinedio_mutex_unlock(&inst->usb_access_mutex);
   }
