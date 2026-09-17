@@ -642,6 +642,10 @@ unlock:
 void pinedio_deinit(struct pinedio_inst *inst) {
   pinedio_mutex_lock(&inst->usb_access_mutex);
   if (inst->int_running_cnt != 0) {
+    /* Whoever drops the count to 0 under the lock owns the thread. Zeroing it here
+     * makes a concurrent pinedio_deattach_interrupt() bail out instead of joining
+     * or detaching the same thread a second time. */
+    inst->int_running_cnt = 0;
     inst->pin_poll_thread_exit = true;
     pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
     pinedio_mutex_unlock(&inst->usb_access_mutex);
