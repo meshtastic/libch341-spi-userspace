@@ -559,7 +559,12 @@ static void* pinedio_pin_poll_thread(void* arg) {
       inst_int->previous_state = state;
     }
 
-    should_exit = inst->pin_poll_thread_exit;
+    /* A deattach from the callback detaches this thread without waiting for it, so
+     * a quick re-attach can start the next poll thread and clear the exit flag
+     * before we read it. The handle then names that successor: stand down rather
+     * than poll alongside it. The re-armed pin cannot fire in this last iteration,
+     * since attach reset its previous_state to 255. */
+    should_exit = inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self());
     pinedio_mutex_unlock(&inst->usb_access_mutex);
     platform_sleep(1000 / 30);
   }
