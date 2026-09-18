@@ -561,6 +561,12 @@ static void* pinedio_pin_poll_thread(void* arg) {
           pinedio_mutex_unlock(&inst->usb_access_mutex);
           callback();
           pinedio_mutex_lock(&inst->usb_access_mutex);
+          /* The callback may have detached this interrupt and re-armed it, which hands the pin to
+           * a successor thread with previous_state reset to 255. Our sample predates that, so stop
+           * here rather than write it back: the successor would read it as its own baseline and
+           * could report an edge spanning the two registrations. */
+          if (inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self()))
+            break;
         }
       }
       inst_int->previous_state = state;
@@ -569,8 +575,7 @@ static void* pinedio_pin_poll_thread(void* arg) {
     /* A deattach from the callback detaches this thread without waiting for it, so
      * a quick re-attach can start the next poll thread and clear the exit flag
      * before we read it. The handle then names that successor: stand down rather
-     * than poll alongside it. The re-armed pin cannot fire in this last iteration,
-     * since attach reset its previous_state to 255. */
+     * than poll alongside it. */
     should_exit = inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self());
     pinedio_mutex_unlock(&inst->usb_access_mutex);
     if (should_exit)
@@ -702,4 +707,10 @@ void pinedio_deinit(struct pinedio_inst *inst) {
     libusb_close(inst->handle);
     inst->handle = NULL;
   }
+
+  /* Only once no poll thread can reach it: a self-teardown leaves one running, and it still
+   * broadcasts on its way out. Skipping this would leave a re-init of the same static instance
+   * re-initializing a live condition variable. */
+  if (!self_is_poll)
+    pthread_cond_destroy(&inst->pin_poll_thread_gone);
 }

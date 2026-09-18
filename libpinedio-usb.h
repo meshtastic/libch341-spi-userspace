@@ -68,7 +68,7 @@ struct pinedio_inst {
   bool pin_poll_thread_exit;
   /* Poll threads that have not returned yet, including ones that detached themselves and so cannot
    * be joined. pinedio_deinit() waits for the count to reach 0 before the device and inst go away. */
-  uint8_t pin_poll_threads_alive;
+  uint32_t pin_poll_threads_alive;
   pthread_cond_t pin_poll_thread_gone;
   bool in_error;
   struct pinedio_inst_int interrupts[PINEDIO_INT_PIN_MAX];
@@ -88,6 +88,9 @@ int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
+/* Returns once no poll thread can touch inst any more, so the caller may then release it. The one
+ * exception is a call from an interrupt callback, which cannot wait for the thread it runs on: that
+ * thread outlives the call, so deinitializing from a callback is not supported. */
 void pinedio_deinit(struct pinedio_inst* inst);
 
 #ifdef __cplusplus
