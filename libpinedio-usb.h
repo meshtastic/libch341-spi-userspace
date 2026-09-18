@@ -66,6 +66,11 @@ struct pinedio_inst {
   pthread_mutex_t usb_access_mutex;
   pthread_t pin_poll_thread;
   bool pin_poll_thread_exit;
+  /* Poll threads not returned yet, self-detached ones included: pinedio_deinit() waits it out. */
+  uint32_t pin_poll_threads_alive;
+  pthread_cond_t pin_poll_thread_gone;
+  /* Set once pinedio_deinit() starts tearing the instance down; no further attachment is accepted. */
+  bool deinit_started;
   bool in_error;
   struct pinedio_inst_int interrupts[PINEDIO_INT_PIN_MAX];
   uint32_t options[PINEDIO_OPTION_MAX];
@@ -84,6 +89,8 @@ int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
 int32_t pinedio_deattach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin);
+/* Returns once no poll thread can touch inst, so the caller may release it. Not supported from an
+ * interrupt callback: that thread outlives the call, since it cannot wait for itself. */
 void pinedio_deinit(struct pinedio_inst* inst);
 
 #ifdef __cplusplus
