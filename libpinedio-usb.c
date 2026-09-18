@@ -530,8 +530,8 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
   return (input & (1 << pin)) != 0 ? 1 : 0;
 }
 
-/* True on a poll thread, including one that has been superseded and is on its way out. Comparing
- * against inst->pin_poll_thread cannot answer that, since a successor overwrites the handle. */
+/* True on any poll thread, superseded ones included: a successor overwrites pin_poll_thread, so
+ * the handle cannot answer that. */
 static __thread bool this_is_pin_poll_thread = false;
 
 static void* pinedio_pin_poll_thread(void* arg) {
@@ -567,14 +567,11 @@ static void* pinedio_pin_poll_thread(void* arg) {
           pinedio_mutex_unlock(&inst->usb_access_mutex);
           callback();
           pinedio_mutex_lock(&inst->usb_access_mutex);
-          /* The callback may have detached this interrupt and re-armed it, which hands the pin to
-           * a successor thread with previous_state reset to 255. Our sample predates that, so stop
-           * here rather than write it back: the successor would read it as its own baseline and
-           * could report an edge spanning the two registrations. */
+          /* A re-arm during the callback hands the pin to a successor with previous_state reset to
+           * 255; our pre-callback sample must not become its baseline. */
           if (inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self()))
             break;
-          /* Same thread, but a re-arm of this very pin during the callback also resets
-           * previous_state to 255, and it was not 255 when we entered this branch. */
+          /* Same thread, same sentinel: it was not 255 when this branch was entered. */
           if (inst_int->previous_state == 255)
             continue;
         }
@@ -582,10 +579,8 @@ static void* pinedio_pin_poll_thread(void* arg) {
       inst_int->previous_state = state;
     }
 
-    /* A deattach from the callback detaches this thread without waiting for it, so
-     * a quick re-attach can start the next poll thread and clear the exit flag
-     * before we read it. The handle then names that successor: stand down rather
-     * than poll alongside it. */
+    /* A re-attach can start the successor and clear the exit flag before we read it, so the
+     * handle is the tiebreak: stand down rather than poll alongside it. */
     should_exit = inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self());
     pinedio_mutex_unlock(&inst->usb_access_mutex);
     if (should_exit)
@@ -682,20 +677,17 @@ unlock:
 
 void pinedio_deinit(struct pinedio_inst *inst) {
   pinedio_mutex_lock(&inst->usb_access_mutex);
-  /* Whoever drops the count to 0 under the lock owns the thread. Zeroing it here
-   * makes a concurrent pinedio_deattach_interrupt() bail out instead of joining
-   * or detaching the same thread a second time. */
+  /* Whoever drops the count to 0 under the lock owns the thread, so zeroing it here keeps a
+   * concurrent pinedio_deattach_interrupt() from claiming the same one. */
   bool stop = inst->int_running_cnt != 0;
   pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
   inst->int_running_cnt = 0;
   inst->pin_poll_thread_exit = true;
-  /* Reject attachments from here on: pthread_cond_wait() below drops the mutex, and an attach
-   * getting in would start a poll thread that we then either wait on forever or pull the device
-   * out from under. */
+  /* pthread_cond_wait() below drops the mutex: an attach getting in would start a poll thread we
+   * then wait on forever, or tear the device out from under. */
   inst->deinit_started = true;
-  /* A poll thread that detached itself in a callback is not joinable, but still reads inst and
-   * the device until it returns, so wait out every live one. Nothing to wait for when we are it,
-   * and waiting would deadlock, since only this thread can decrement the count. */
+  /* A self-detached thread is not joinable but still reads inst, so wait every live one out.
+   * Waiting when we are one would deadlock: only it can decrement the count. */
   bool self_is_poll = this_is_pin_poll_thread;
   while (inst->pin_poll_threads_alive > 0 && !self_is_poll)
     pthread_cond_wait(&inst->pin_poll_thread_gone, &inst->usb_access_mutex);
