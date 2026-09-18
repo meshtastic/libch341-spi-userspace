@@ -70,6 +70,8 @@ struct pinedio_inst {
    * be joined. pinedio_deinit() waits for the count to reach 0 before the device and inst go away. */
   uint32_t pin_poll_threads_alive;
   pthread_cond_t pin_poll_thread_gone;
+  /* Set once pinedio_deinit() starts tearing the instance down; no further attachment is accepted. */
+  bool deinit_started;
   bool in_error;
   struct pinedio_inst_int interrupts[PINEDIO_INT_PIN_MAX];
   uint32_t options[PINEDIO_OPTION_MAX];

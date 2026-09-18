@@ -225,6 +225,7 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
   }
 
   inst->pin_poll_threads_alive = 0;
+  inst->deinit_started = false;
   ret = pthread_cond_init(&inst->pin_poll_thread_gone, NULL);
   if (ret != 0) {
     fprintf(stderr, "Failed to initialize condition variable, res: %d.\n", ret);
@@ -529,9 +530,14 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
   return (input & (1 << pin)) != 0 ? 1 : 0;
 }
 
+/* True on a poll thread, including one that has been superseded and is on its way out. Comparing
+ * against inst->pin_poll_thread cannot answer that, since a successor overwrites the handle. */
+static __thread bool this_is_pin_poll_thread = false;
+
 static void* pinedio_pin_poll_thread(void* arg) {
   struct pinedio_inst *inst = arg;
   int32_t ret = 0;
+  this_is_pin_poll_thread = true;
   bool should_exit = false;
 
   uint32_t input;
@@ -601,6 +607,10 @@ pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin
   int32_t res = 0;
   // TODO: Add check if int_pin is correct
   pinedio_mutex_lock(&inst->usb_access_mutex);
+  if (inst->deinit_started) {
+    pinedio_mutex_unlock(&inst->usb_access_mutex);
+    return -1;
+  }
   bool was_attached = inst->interrupts[int_pin].callback != NULL;
   inst->interrupts[int_pin].previous_state = 255;
   inst->interrupts[int_pin].mode = int_mode;
@@ -679,15 +689,22 @@ void pinedio_deinit(struct pinedio_inst *inst) {
   pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
   inst->int_running_cnt = 0;
   inst->pin_poll_thread_exit = true;
+  /* Reject attachments from here on: pthread_cond_wait() below drops the mutex, and an attach
+   * getting in would start a poll thread that we then either wait on forever or pull the device
+   * out from under. */
+  inst->deinit_started = true;
   /* A poll thread that detached itself in a callback is not joinable, but still reads inst and
-   * the device until it returns, so wait out every live one. Nothing to wait for when we are it. */
-  bool self_is_poll = stop && pthread_equal(thread_to_join, pthread_self());
+   * the device until it returns, so wait out every live one. Nothing to wait for when we are it,
+   * and waiting would deadlock, since only this thread can decrement the count. */
+  bool self_is_poll = this_is_pin_poll_thread;
   while (inst->pin_poll_threads_alive > 0 && !self_is_poll)
     pthread_cond_wait(&inst->pin_poll_thread_gone, &inst->usb_access_mutex);
   pinedio_mutex_unlock(&inst->usb_access_mutex);
 
+  /* Keyed on the handle, not on self_is_poll: a superseded thread calling this is not the one
+   * named by pin_poll_thread, and has already detached itself. */
   if (stop) {
-    if (!self_is_poll)
+    if (!pthread_equal(thread_to_join, pthread_self()))
       pthread_join(thread_to_join, NULL);
     else
       pthread_detach(pthread_self()); /* same self-call strand as above */
