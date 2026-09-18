@@ -567,6 +567,10 @@ static void* pinedio_pin_poll_thread(void* arg) {
            * could report an edge spanning the two registrations. */
           if (inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self()))
             break;
+          /* Same thread, but a re-arm of this very pin during the callback also resets
+           * previous_state to 255, and it was not 255 when we entered this branch. */
+          if (inst_int->previous_state == 255)
+            continue;
         }
       }
       inst_int->previous_state = state;
