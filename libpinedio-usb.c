@@ -224,6 +224,13 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
     return -1;
   }
 
+  inst->pin_poll_threads_alive = 0;
+  ret = pthread_cond_init(&inst->pin_poll_thread_gone, NULL);
+  if (ret != 0) {
+    fprintf(stderr, "Failed to initialize condition variable, res: %d.\n", ret);
+    return -1;
+  }
+
   ret = libusb_init(NULL);
   if (ret < 0) {
     fprintf(stderr, "Couldn't initialize libusb!\n");
@@ -566,8 +573,17 @@ static void* pinedio_pin_poll_thread(void* arg) {
      * since attach reset its previous_state to 255. */
     should_exit = inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self());
     pinedio_mutex_unlock(&inst->usb_access_mutex);
+    if (should_exit)
+      break; /* no point sleeping on the way out, and it keeps a deinit wait short */
     platform_sleep(1000 / 30);
   }
+
+  /* Last touch of inst: after this a deinit may free it and close the device. */
+  pinedio_mutex_lock(&inst->usb_access_mutex);
+  inst->pin_poll_threads_alive--;
+  pthread_cond_broadcast(&inst->pin_poll_thread_gone);
+  pinedio_mutex_unlock(&inst->usb_access_mutex);
+  return NULL;
 }
 
 int32_t
@@ -596,6 +612,7 @@ pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin
         inst->interrupts[int_pin].callback = NULL;
         goto unlock;
       }
+      inst->pin_poll_threads_alive++;
     }
     inst->int_running_cnt++;
   }
@@ -646,20 +663,25 @@ unlock:
 
 void pinedio_deinit(struct pinedio_inst *inst) {
   pinedio_mutex_lock(&inst->usb_access_mutex);
-  if (inst->int_running_cnt != 0) {
-    /* Whoever drops the count to 0 under the lock owns the thread. Zeroing it here
-     * makes a concurrent pinedio_deattach_interrupt() bail out instead of joining
-     * or detaching the same thread a second time. */
-    inst->int_running_cnt = 0;
-    inst->pin_poll_thread_exit = true;
-    pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
-    if (!pthread_equal(thread_to_join, pthread_self()))
+  /* Whoever drops the count to 0 under the lock owns the thread. Zeroing it here
+   * makes a concurrent pinedio_deattach_interrupt() bail out instead of joining
+   * or detaching the same thread a second time. */
+  bool stop = inst->int_running_cnt != 0;
+  pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
+  inst->int_running_cnt = 0;
+  inst->pin_poll_thread_exit = true;
+  /* A poll thread that detached itself in a callback is not joinable, but still reads inst and
+   * the device until it returns, so wait out every live one. Nothing to wait for when we are it. */
+  bool self_is_poll = stop && pthread_equal(thread_to_join, pthread_self());
+  while (inst->pin_poll_threads_alive > 0 && !self_is_poll)
+    pthread_cond_wait(&inst->pin_poll_thread_gone, &inst->usb_access_mutex);
+  pinedio_mutex_unlock(&inst->usb_access_mutex);
+
+  if (stop) {
+    if (!self_is_poll)
       pthread_join(thread_to_join, NULL);
     else
       pthread_detach(pthread_self()); /* same self-call strand as above */
-  } else {
-    pinedio_mutex_unlock(&inst->usb_access_mutex);
   }
 
   for (int i = 0; i < USB_IN_TRANSFERS; i++) {

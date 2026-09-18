@@ -66,6 +66,10 @@ struct pinedio_inst {
   pthread_mutex_t usb_access_mutex;
   pthread_t pin_poll_thread;
   bool pin_poll_thread_exit;
+  /* Poll threads that have not returned yet, including ones that detached themselves and so cannot
+   * be joined. pinedio_deinit() waits for the count to reach 0 before the device and inst go away. */
+  uint8_t pin_poll_threads_alive;
+  pthread_cond_t pin_poll_thread_gone;
   bool in_error;
   struct pinedio_inst_int interrupts[PINEDIO_INT_PIN_MAX];
   uint32_t options[PINEDIO_OPTION_MAX];
