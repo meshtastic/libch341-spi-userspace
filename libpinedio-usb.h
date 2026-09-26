@@ -42,6 +42,8 @@ enum pinedio_option {
     PINEDIO_OPTION_SEARCH_SERIAL,
     PINEDIO_OPTION_VID,
     PINEDIO_OPTION_PID,
+    /* Microseconds between pin polls, which bounds interrupt latency. 0 means the default, 1000. */
+    PINEDIO_OPTION_POLL_INTERVAL_US,
     PINEDIO_OPTION_MAX
 };
 

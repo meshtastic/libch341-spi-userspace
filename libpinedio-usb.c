@@ -541,11 +541,13 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
  * the handle cannot answer that. */
 static __thread bool this_is_pin_poll_thread = false;
 
-#define PIN_POLL_INTERVAL_MS (1000 / 30)
+/* An interrupt is seen up to one interval plus one USB read after the pin changes. This was 1000 / 30 ms,
+ * which left a radio's TX_DONE and RX_DONE a median ~30 ms late. PINEDIO_OPTION_POLL_INTERVAL_US overrides it. */
+#define PIN_POLL_INTERVAL_DEFAULT_US 1000L
 
 /* Sleep one poll interval, or less if this thread is told to stop. A plain sleep made every detach of
- * the last pin wait out the rest of it in pthread_join(): 0-33 ms, on a path the radio calls before
- * every channel scan. Returns true if the thread should exit. */
+ * the last pin wait out the rest of it in pthread_join(), on a path the radio calls before every channel
+ * scan. Returns true if the thread should exit. */
 static bool pinedio_pin_poll_wait(struct pinedio_inst *inst) {
   struct timespec deadline;
 #ifdef __linux__
@@ -553,7 +555,11 @@ static bool pinedio_pin_poll_wait(struct pinedio_inst *inst) {
 #else
   clock_gettime(CLOCK_REALTIME, &deadline);
 #endif
-  deadline.tv_nsec += PIN_POLL_INTERVAL_MS * 1000000L;
+  long interval_us = inst->options[PINEDIO_OPTION_POLL_INTERVAL_US];
+  if (interval_us == 0)
+    interval_us = PIN_POLL_INTERVAL_DEFAULT_US;
+  deadline.tv_sec += interval_us / 1000000L;
+  deadline.tv_nsec += (interval_us % 1000000L) * 1000L;
   if (deadline.tv_nsec >= 1000000000L) {
     deadline.tv_sec++;
     deadline.tv_nsec -= 1000000000L;
