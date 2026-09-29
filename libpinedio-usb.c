@@ -483,9 +483,11 @@ int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_
   if (ret < 0)
     return -1;
 
+  /* Indexed, not *read_buf++ = reverse_byte(*read_buf): the read and the increment of read_buf are
+   * unsequenced there, which gcc warns about under -Wsequence-point. */
   unsigned int i;
   for (i = 0; i < count; i++) {
-    *read_buf++ = reverse_byte(*read_buf);
+    read_buf[i] = reverse_byte(read_buf[i]);
   }
 
   return 0;
