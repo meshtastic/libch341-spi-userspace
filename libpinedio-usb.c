@@ -72,10 +72,15 @@ static void LIBUSB_CALL cb_in(struct libusb_transfer *transfer) {
   cb_common(__func__, transfer);
 }
 
-static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigned int writecnt, unsigned int readcnt,
-                            const uint8_t *writearr, uint8_t *readarr, bool lock)
+/* usb_transfer() with a second OUT transfer queued straight behind the first, for bytes that cannot share its
+ * transfer: the kernel keeps an endpoint's transfers in order, so the device sees them in turn without the host
+ * waiting between them. */
+static int32_t usb_transfer_tail(struct pinedio_inst *inst, const char *func, unsigned int writecnt, unsigned int readcnt,
+                                 const uint8_t *writearr, uint8_t *readarr, bool lock, const uint8_t *tailarr,
+                                 unsigned int tailcnt)
 {
   int state_out = TRANS_IDLE;
+  int state_tail = TRANS_IDLE;
 
   if (lock) {
     pinedio_mutex_lock(&inst->usb_access_mutex);
@@ -92,6 +97,19 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
     if (ret) {
       fprintf(stderr, "%s: failed to submit OUT transfer: %s\n", func, libusb_error_name(ret));
       state_out = TRANS_ERR;
+      goto err;
+    }
+  }
+  unsigned int tail_done = 0;
+  if (tailcnt > 0) {
+    inst->transfer_out_tail->buffer = (uint8_t*)tailarr;
+    inst->transfer_out_tail->length = tailcnt;
+    inst->transfer_out_tail->user_data = &state_tail;
+    state_tail = TRANS_ACTIVE;
+    int ret = libusb_submit_transfer(inst->transfer_out_tail);
+    if (ret) {
+      fprintf(stderr, "%s: failed to submit OUT tail transfer: %s\n", func, libusb_error_name(ret));
+      state_tail = TRANS_ERR;
       goto err;
     }
   }
@@ -137,6 +155,14 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
         state_out = TRANS_IDLE;
       }
     }
+    if (tail_done < tailcnt) {
+      if (state_tail == TRANS_ERR) {
+        goto err;
+      } else if (state_tail > 0) {
+        tail_done += state_tail;
+        state_tail = TRANS_IDLE;
+      }
+    }
     /* Check for completed transfers. */
     while (state_in[in_idx] != TRANS_IDLE && state_in[in_idx] != TRANS_ACTIVE) {
       if (state_in[in_idx] == TRANS_ERR) {
@@ -148,7 +174,7 @@ static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigne
       state_in[in_idx] = TRANS_IDLE;
       in_idx = (in_idx + 1) % USB_IN_TRANSFERS; /* Increment (and wrap around). */
     }
-  } while ((out_done < writecnt) || (in_done < readcnt));
+  } while ((out_done < writecnt) || (tail_done < tailcnt) || (in_done < readcnt));
 
   if (lock) {
     pinedio_mutex_unlock(&inst->usb_access_mutex);
@@ -163,6 +189,10 @@ err:
     if (libusb_cancel_transfer(inst->transfer_out) != 0)
       state_out = TRANS_ERR;
   }
+  if ((tailcnt > 0) && (state_tail == TRANS_ACTIVE)) {
+    if (libusb_cancel_transfer(inst->transfer_out_tail) != 0)
+      state_tail = TRANS_ERR;
+  }
   if (readcnt > 0) {
     unsigned int i;
     for (i = 0; i < USB_IN_TRANSFERS; i++) {
@@ -176,6 +206,8 @@ err:
   while (1) {
     bool finished = true;
     if ((writecnt > 0) && (state_out == TRANS_ACTIVE))
+      finished = false;
+    if ((tailcnt > 0) && (state_tail == TRANS_ACTIVE))
       finished = false;
     if (readcnt > 0) {
       unsigned int i;
@@ -192,6 +224,12 @@ err:
     pinedio_mutex_unlock(&inst->usb_access_mutex);
   }
   return -1;
+}
+
+static int32_t usb_transfer(struct pinedio_inst *inst, const char *func, unsigned int writecnt, unsigned int readcnt,
+                            const uint8_t *writearr, uint8_t *readarr, bool lock)
+{
+  return usb_transfer_tail(inst, func, writecnt, readcnt, writearr, readarr, lock, NULL, 0);
 }
 
 static uint8_t reverse_byte(uint8_t x) {
@@ -311,6 +349,11 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
     fprintf(stderr, "Failed to alloc libusb OUT transfer.\n");
     goto deinit_on_error;
   }
+  inst->transfer_out_tail = libusb_alloc_transfer(0);
+  if (!inst->transfer_out_tail) {
+    fprintf(stderr, "Failed to alloc libusb OUT tail transfer.\n");
+    goto deinit_on_error;
+  }
   for (int i = 0; i < USB_IN_TRANSFERS; i++) {
     inst->transfer_ins[i] = libusb_alloc_transfer(0);
     if (inst->transfer_ins[i] == NULL) {
@@ -321,6 +364,8 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
 
   // We use these helpers but don't fill the actual buffer yet.
   libusb_fill_bulk_transfer(inst->transfer_out, inst->handle, CH341_WRITE_EP, NULL, 0, cb_out, NULL, CH341_USB_TIMEOUT);
+  libusb_fill_bulk_transfer(inst->transfer_out_tail, inst->handle, CH341_WRITE_EP, NULL, 0, cb_out, NULL,
+                            CH341_USB_TIMEOUT);
   for (int i = 0; i < USB_IN_TRANSFERS; i++)
     libusb_fill_bulk_transfer(inst->transfer_ins[i], inst->handle, CH341_READ_EP, NULL, 0, cb_in, NULL,
                               CH341_USB_TIMEOUT);
@@ -490,10 +535,86 @@ int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_
   if (ret < 0)
     return -1;
 
+  /* Indexed, not *read_buf++ = reverse_byte(*read_buf): the read and the increment of read_buf are
+   * unsequenced there, which gcc warns about under -Wsequence-point. */
   unsigned int i;
   for (i = 0; i < count; i++) {
-    *read_buf++ = reverse_byte(*read_buf);
+    read_buf[i] = reverse_byte(read_buf[i]);
   }
+
+  return 0;
+}
+
+/* CS is D0 on these adapters, and consumers drive it low to select and high to deselect. */
+#define PINEDIO_CS_PIN 0
+
+/* The CH341 frames an OUT stream by 32-byte USB packet - it answers each one separately, which is why the SPI data
+ * is cut into 31-byte chunks - and stops at STM_END, ignoring the rest of the packet. So the UIO packet ahead of the
+ * SPI stream fills a whole padded packet, and the first SPI packet still starts on a boundary. */
+#define PINEDIO_UIO_SLOT CH341_PACKET_LENGTH
+
+/* One GPIO-state packet in its slot. Masked to D0-D5: STM_OUT is 0x80 and STM_DIR 0x40, so a state bit at
+ * 0x40 or above would turn the level byte into another command. */
+static void pinedio_uio_packet(uint8_t *slot, uint16_t state) {
+  memset(slot, 0, PINEDIO_UIO_SLOT);
+  slot[0] = CH341_CMD_UIO_STREAM;
+  slot[1] = CH341_CMD_UIO_STM_OUT | (state & 0x3F);
+  slot[2] = CH341_CMD_UIO_STM_DIR | (pinedio_d_mode & 0x3F);
+  slot[3] = CH341_CMD_UIO_STM_END;
+}
+
+/* pinedio_transceive() with CS (D0) driven low ahead of the stream in the same USB transfer, and high again in a
+ * second transfer queued straight behind it.
+ *
+ * Each CS level change is otherwise its own pinedio_digital_write(), a whole bulk transfer to carry one byte of GPIO
+ * state, and the host waits for each in turn. The CS-high cannot join the stream's own transfer: a partial last SPI
+ * packet ends it with a short USB packet, and padding the SPI packet instead would clock the padding out at the
+ * device. Queued as its own transfer, it starts on a packet boundary and the host still waits only once. */
+int32_t pinedio_transceive_select(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count) {
+  if (count == 0)
+    return 0;
+  const size_t packets = (count + CH341_PACKET_LENGTH - 2) / (CH341_PACKET_LENGTH - 1);
+  uint8_t wbuf[PINEDIO_UIO_SLOT + packets*CH341_PACKET_LENGTH];
+
+  /* Hold usb_access_mutex across the read of the shadow state, the buffer it goes into and the transfer, as
+   * pinedio_digital_write() does: the poll thread runs its callback with the mutex released, and consumers
+   * drive GPIO from that callback while the main thread does too. usb_transfer() is told not to take it
+   * again - it is a plain mutex, not a recursive one. */
+  pinedio_mutex_lock(&inst->usb_access_mutex);
+  pinedio_d_state &= ~(1u << PINEDIO_CS_PIN);
+  pinedio_uio_packet(wbuf, pinedio_d_state);
+
+  uint8_t *spi = wbuf + PINEDIO_UIO_SLOT;
+  unsigned int write_left = count;
+  unsigned int p;
+  for (p = 0; p < packets; p++) {
+    unsigned int write_now = MIN(CH341_PACKET_LENGTH - 1, write_left);
+    uint8_t *ptr = &spi[p*CH341_PACKET_LENGTH];
+    *ptr++ = CH341_CMD_SPI_STREAM;
+    unsigned int i;
+    for (i = 0; i < write_now; ++i)
+      *ptr++ = reverse_byte(*write_buf++);
+    write_left -= write_now;
+  }
+
+  /* The SPI region is submitted compactly, as pinedio_transceive() does: every packet but the last is full, so the
+   * compact length and the 32-byte stride agree. */
+  pinedio_d_state |= (1u << PINEDIO_CS_PIN);
+  const uint8_t tail[] = {
+    CH341_CMD_UIO_STREAM,
+    CH341_CMD_UIO_STM_OUT | (pinedio_d_state & 0x3F),
+    CH341_CMD_UIO_STM_DIR | (pinedio_d_mode & 0x3F),
+    CH341_CMD_UIO_STM_END,
+  };
+  int32_t ret = usb_transfer_tail(inst, __func__, PINEDIO_UIO_SLOT + packets + count, count, wbuf, read_buf, false,
+                                  tail, sizeof(tail));
+  pinedio_mutex_unlock(&inst->usb_access_mutex);
+  if (ret < 0)
+    return -1;
+
+  unsigned int i;
+  for (i = 0; i < count; i++)
+    read_buf[i] = reverse_byte(read_buf[i]);
 
   return 0;
 }
@@ -753,6 +874,10 @@ void pinedio_deinit(struct pinedio_inst *inst) {
   }
   if (inst->transfer_out != NULL) {
     libusb_free_transfer(inst->transfer_out);
+  }
+  if (inst->transfer_out_tail != NULL) {
+    libusb_free_transfer(inst->transfer_out_tail);
+    inst->transfer_out_tail = NULL;
   }
   
   if (inst->handle != NULL) {

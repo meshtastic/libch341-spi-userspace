@@ -63,6 +63,8 @@ struct pinedio_inst {
    * because USB spec says that transfers end on non-full packets and the device sends the 31 reply
    * data bytes to each 32-byte packet with command + 31 bytes of data... */
   struct libusb_transfer *transfer_out;
+  /* A second OUT transfer, queued behind transfer_out for bytes that must start on a packet boundary */
+  struct libusb_transfer *transfer_out_tail;
   struct libusb_transfer *transfer_ins[USB_IN_TRANSFERS];
   uint8_t int_running_cnt;
   pthread_mutex_t usb_access_mutex;
@@ -89,6 +91,11 @@ int32_t pinedio_digital_write(struct pinedio_inst *inst, uint32_t pin, bool acti
 int32_t pinedio_set_cs(struct pinedio_inst *inst, bool active);
 int32_t pinedio_write_read(struct pinedio_inst* inst, uint8_t *writearr, uint32_t writecnt, uint8_t* readarr, uint32_t readcnt);
 int32_t pinedio_transceive(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count);
+/* As pinedio_transceive(), but it drives CS (D0) low before the stream and high again after it, costing one wait on
+ * the bus instead of three. Consumers that drive CS themselves - RadioLib does, one spiTransfer per CS window - should
+ * stop writing either level and call this instead. PINEDIO_HAS_TRANSCEIVE_SELECT says the library has it. */
+#define PINEDIO_HAS_TRANSCEIVE_SELECT 1
+int32_t pinedio_transceive_select(struct pinedio_inst* inst, uint8_t *write_buf, uint8_t* read_buf, uint32_t count);
 int32_t pinedio_digital_read(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin);
 int32_t pinedio_attach_interrupt(struct pinedio_inst* inst, enum pinedio_int_pin int_pin, enum pinedio_int_mode int_mode, void (*callback)(void));
