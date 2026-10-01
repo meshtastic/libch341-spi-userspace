@@ -10,8 +10,10 @@
  * Copyright (C) 2015 Urja Rannikko <urjaman@gmail.com>
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "libpinedio-usb.h"
 
@@ -42,14 +44,6 @@ uint16_t pinedio_d_mode = 0;
 uint16_t pinedio_d_state = 0;
 
 enum trans_state {TRANS_ACTIVE = -2, TRANS_ERR = -1, TRANS_IDLE = 0};
-
-static void platform_sleep(uint32_t msecs) {
-#ifdef __WIN32
-  Sleep(msecs);
-#else
-  usleep(msecs * 1000);
-#endif
-}
 
 static void cb_common(const char* func, struct libusb_transfer *transfer) {
   int* transfer_cnt = (int *) transfer->user_data;
@@ -227,6 +221,19 @@ int32_t pinedio_init(struct pinedio_inst *inst, void *driver) {
   inst->pin_poll_threads_alive = 0;
   inst->deinit_started = false;
   ret = pthread_cond_init(&inst->pin_poll_thread_gone, NULL);
+  if (ret != 0) {
+    fprintf(stderr, "Failed to initialize condition variable, res: %d.\n", ret);
+    return -1;
+  }
+  /* The poll sleep is a timed wait on this, so time it on the monotonic clock where we can: a wall
+   * clock stepped back by NTP would otherwise stall interrupt polling for the size of the step. */
+  pthread_condattr_t wake_attr;
+  pthread_condattr_init(&wake_attr);
+#ifdef __linux__
+  pthread_condattr_setclock(&wake_attr, CLOCK_MONOTONIC);
+#endif
+  ret = pthread_cond_init(&inst->pin_poll_wake, &wake_attr);
+  pthread_condattr_destroy(&wake_attr);
   if (ret != 0) {
     fprintf(stderr, "Failed to initialize condition variable, res: %d.\n", ret);
     return -1;
@@ -534,6 +541,40 @@ int32_t pinedio_get_irq_state(struct pinedio_inst *inst, uint32_t pin) {
  * the handle cannot answer that. */
 static __thread bool this_is_pin_poll_thread = false;
 
+/* An interrupt is seen up to one interval plus one USB read after the pin changes. This was 1000 / 30 ms,
+ * which left a radio's TX_DONE and RX_DONE a median ~30 ms late. PINEDIO_OPTION_POLL_INTERVAL_US overrides it. */
+#define PIN_POLL_INTERVAL_DEFAULT_US 1000L
+
+/* Sleep one poll interval, or less if this thread is told to stop. A plain sleep made every detach of
+ * the last pin wait out the rest of it in pthread_join(), on a path the radio calls before every channel
+ * scan. Returns true if the thread should exit. */
+static bool pinedio_pin_poll_wait(struct pinedio_inst *inst) {
+  struct timespec deadline;
+#ifdef __linux__
+  clock_gettime(CLOCK_MONOTONIC, &deadline); /* the clock pin_poll_wake was initialised with */
+#else
+  clock_gettime(CLOCK_REALTIME, &deadline);
+#endif
+  long interval_us = inst->options[PINEDIO_OPTION_POLL_INTERVAL_US];
+  if (interval_us == 0)
+    interval_us = PIN_POLL_INTERVAL_DEFAULT_US;
+  deadline.tv_sec += interval_us / 1000000L;
+  deadline.tv_nsec += (interval_us % 1000000L) * 1000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+  bool should_exit;
+  pinedio_mutex_lock(&inst->usb_access_mutex);
+  for (;;) {
+    should_exit = inst->pin_poll_thread_exit || !pthread_equal(inst->pin_poll_thread, pthread_self());
+    if (should_exit || pthread_cond_timedwait(&inst->pin_poll_wake, &inst->usb_access_mutex, &deadline) == ETIMEDOUT)
+      break;
+  }
+  pinedio_mutex_unlock(&inst->usb_access_mutex);
+  return should_exit;
+}
+
 static void* pinedio_pin_poll_thread(void* arg) {
   struct pinedio_inst *inst = arg;
   int32_t ret = 0;
@@ -585,7 +626,7 @@ static void* pinedio_pin_poll_thread(void* arg) {
     pinedio_mutex_unlock(&inst->usb_access_mutex);
     if (should_exit)
       break; /* no point sleeping on the way out, and it keeps a deinit wait short */
-    platform_sleep(1000 / 30);
+    should_exit = pinedio_pin_poll_wait(inst);
   }
 
   /* Last touch of inst: after this a deinit may free it and close the device. */
@@ -621,6 +662,7 @@ pinedio_attach_interrupt(struct pinedio_inst *inst, enum pinedio_int_pin int_pin
     if (inst->int_running_cnt == 0) {
       inst->pin_poll_thread_exit = false;
       res = pthread_create(&inst->pin_poll_thread, NULL, pinedio_pin_poll_thread, inst);
+      pthread_cond_broadcast(&inst->pin_poll_wake); /* a superseded thread stands down now, not after its sleep */
       if (res != 0) {
         fprintf(stderr, "Failed to create thread, res: %d\n", res);
         inst->interrupts[int_pin].callback = NULL;
@@ -648,6 +690,7 @@ int32_t pinedio_deattach_interrupt(struct pinedio_inst *inst, enum pinedio_int_p
   inst->int_running_cnt--;
   if (inst->int_running_cnt == 0) {
     inst->pin_poll_thread_exit = true;
+    pthread_cond_broadcast(&inst->pin_poll_wake);
     /* Copy the handle before releasing the lock: a concurrent attach would
      * overwrite inst->pin_poll_thread with a newly created thread, and we would
      * join that one instead. Joining under the lock is not an option, since the
@@ -683,6 +726,7 @@ void pinedio_deinit(struct pinedio_inst *inst) {
   pthread_t thread_to_join = inst->pin_poll_thread; /* copy before unlocking, as above */
   inst->int_running_cnt = 0;
   inst->pin_poll_thread_exit = true;
+  pthread_cond_broadcast(&inst->pin_poll_wake);
   /* pthread_cond_wait() below drops the mutex: an attach getting in would start a poll thread we
    * then wait on forever, or tear the device out from under. */
   inst->deinit_started = true;
@@ -724,6 +768,8 @@ void pinedio_deinit(struct pinedio_inst *inst) {
   /* Only once no poll thread can reach it: a self-teardown leaves one running, and it still
    * broadcasts on its way out. Skipping this would leave a re-init of the same static instance
    * re-initializing a live condition variable. */
-  if (!self_is_poll)
+  if (!self_is_poll) {
     pthread_cond_destroy(&inst->pin_poll_thread_gone);
+    pthread_cond_destroy(&inst->pin_poll_wake);
+  }
 }

@@ -42,6 +42,8 @@ enum pinedio_option {
     PINEDIO_OPTION_SEARCH_SERIAL,
     PINEDIO_OPTION_VID,
     PINEDIO_OPTION_PID,
+    /* Microseconds between pin polls, which bounds interrupt latency. 0 means the default, 1000. */
+    PINEDIO_OPTION_POLL_INTERVAL_US,
     PINEDIO_OPTION_MAX
 };
 
@@ -69,6 +71,8 @@ struct pinedio_inst {
   /* Poll threads not returned yet, self-detached ones included: pinedio_deinit() waits it out. */
   uint32_t pin_poll_threads_alive;
   pthread_cond_t pin_poll_thread_gone;
+  /* Signalled when a poll thread should stop, so it leaves its sleep at once rather than at the next poll. */
+  pthread_cond_t pin_poll_wake;
   /* Set once pinedio_deinit() starts tearing the instance down; no further attachment is accepted. */
   bool deinit_started;
   bool in_error;
